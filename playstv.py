@@ -108,7 +108,7 @@ def grab_video_urls(driver, urls, test_mode=False):
     return video_urls
 
 
-def download_all(video_url_list, test_mode=False):
+def download_all(video_url_list, test_mode=False, max_retries=30):
     if not os.path.exists(VIDEO_DIR):
         os.makedirs(VIDEO_DIR)
     else:
@@ -123,7 +123,9 @@ def download_all(video_url_list, test_mode=False):
     for title, url in video_url_list:
         filename = os.path.join(VIDEO_DIR, f'{title}.mp4')
         print(f'[*] Downloading {title}...')
-        while True:
+
+        retry_count = 0
+        while retry_count < max_retries:
             try:
                 with requests.get(url, stream=True, allow_redirects=True) as r:
                     r.raise_for_status()
@@ -133,7 +135,10 @@ def download_all(video_url_list, test_mode=False):
                 print(f'[+] Saved: {filename}')
                 break
             except (requests.exceptions.RequestException, ConnectionError):
-                print('[!] Connection error. Retrying...')
+                retry_count += 1
+                print(f'[!] Connection error. Retry {retry_count}/{max_retries}...')
+                if retry_count == max_retries:
+                    print(f'[!] Failed to download {title} after {max_retries} attempts. Skipping.')
                 sleep(2)
                 continue
 
