@@ -119,7 +119,10 @@ def download_all(video_url_list, test_mode=False, max_retries=30):
     if test_mode and len(video_url_list) > 10:
         print(f'[*] Test mode: limiting downloads to 10 videos.')
         video_url_list = video_url_list[:10]
-
+    
+    # Create file to track failed downloads
+    failed_downloads_file = "failed_downloads.txt"
+    
     for title, url in video_url_list:
         filename = os.path.join(VIDEO_DIR, f'{title}.mp4')
         print(f'[*] Downloading {title}...')
@@ -139,6 +142,10 @@ def download_all(video_url_list, test_mode=False, max_retries=30):
                 print(f'[!] Connection error. Retry {retry_count}/{max_retries}...')
                 if retry_count == max_retries:
                     print(f'[!] Failed to download {title} after {max_retries} attempts. Skipping.')
+                    # Write failed download to file
+                    with open(failed_downloads_file, 'a') as f:
+                        f.write(f'{title}|{url}\n')
+                    print(f'[*] Added to {failed_downloads_file}')
                 sleep(2)
                 continue
 
