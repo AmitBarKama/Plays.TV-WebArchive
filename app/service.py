@@ -257,14 +257,15 @@ async def get_connections(username: str, kind: str) -> dict:
 
 # --- stream / download resolution -------------------------------------------
 
-async def resolve_stream(feed_id: str) -> str | None:
+async def resolve_stream(feed_id: str, retry_miss: bool = False) -> str | None:
     """Return a working archived .mp4 URL for a video, trying qualities.
 
     Verified through CDX so we only ever hand the player a URL that exists.
-    Cached after first resolution.
+    Cached after first resolution. Pass ``retry_miss=True`` to re-probe a clip
+    previously cached as having no media (e.g. the archive captured it since).
     """
     cached = cache.get_stream(feed_id)
-    if cached:
+    if cached and (cached["archived_url"] or not retry_miss):
         return cached["archived_url"] or None
 
     v = cache.get_video(feed_id)
@@ -286,7 +287,8 @@ async def resolve_stream(feed_id: str) -> str | None:
         return None
 
     # Probe every quality/host combination in parallel, bounded by a deadline.
-    tasks = [probe(q, h) for q in config.QUALITIES for h in hosts]
+    tasks = [asyncio.create_task(probe(q, h))
+             for q in config.QUALITIES for h in hosts]
     best: tuple[int, str] | None = None
     try:
         for coro in asyncio.as_completed(tasks, timeout=config.STREAM_RESOLVE_DEADLINE):
@@ -295,6 +297,12 @@ async def resolve_stream(feed_id: str) -> str | None:
                 best = res  # prefer higher quality (lower index)
     except asyncio.TimeoutError:
         pass
+    finally:
+        # On timeout, cancel the still-running probes so they stop hitting the
+        # archive and free their concurrency slots immediately.
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     if best:
         cache.put_stream(feed_id, config.QUALITIES[best[0]], best[1])

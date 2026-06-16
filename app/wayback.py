@@ -11,6 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import random
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -46,12 +51,48 @@ async def close() -> None:
         _client = None
 
 
+def _retry_delay(attempt: int, exc: Exception) -> float:
+    """How long to wait before the next retry.
+
+    Honour the archive's `Retry-After` header on 429/503 if present; otherwise
+    exponential backoff. A little jitter avoids a thundering herd of retries
+    lining up after a rate-limit.
+    """
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        ra = resp.headers.get("Retry-After")
+        if ra:
+            secs = _retry_after_seconds(ra)
+            if secs is not None:
+                # Honour the archive's ask, but cap it so we never hold a
+                # concurrency slot for an unbounded stretch.
+                return min(config.MAX_RETRY_AFTER, secs) + random.uniform(0, 0.3)
+    return config.BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 0.3)
+
+
+def _retry_after_seconds(ra: str) -> float | None:
+    """Parse a Retry-After value (delta-seconds or HTTP-date) to seconds, or None."""
+    try:
+        return max(0.0, float(ra))
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(ra)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+    except (ValueError, TypeError):
+        return None
+
+
 async def _request(method: str, url: str, **kwargs) -> httpx.Response:
-    """Issue a request with bounded concurrency + retry/backoff."""
+    """Issue a request with bounded concurrency + polite delay + retry/backoff."""
     client = await get_client()
     last_exc: Exception | None = None
     async with _sema():
         for attempt in range(config.MAX_RETRIES + 1):
+            if config.REQUEST_DELAY:
+                await asyncio.sleep(config.REQUEST_DELAY)
             try:
                 resp = await client.request(method, url, **kwargs)
                 if resp.status_code in (429, 503) or 500 <= resp.status_code < 600:
@@ -63,7 +104,7 @@ async def _request(method: str, url: str, **kwargs) -> httpx.Response:
                 last_exc = exc
                 if attempt >= config.MAX_RETRIES:
                     break
-                await asyncio.sleep(config.BACKOFF_BASE * (2 ** attempt))
+                await asyncio.sleep(_retry_delay(attempt, exc))
     assert last_exc is not None
     raise last_exc
 
@@ -97,7 +138,7 @@ async def fetch_raw(timestamp: str, original_url: str) -> str | None:
     return resp.text
 
 
-async def find_capture(original_url: str, qualities_done: bool = False) -> tuple[str, str] | None:
+async def find_capture(original_url: str) -> tuple[str, str] | None:
     """Return (timestamp, original) of an existing 200 capture for a URL, or None."""
     rows = await cdx(
         original_url, fl="timestamp,original", filter="statuscode:200", limit="1"
@@ -105,3 +146,54 @@ async def find_capture(original_url: str, qualities_done: bool = False) -> tuple
     if len(rows) > 1:
         return rows[1][0], rows[1][1]
     return None
+
+
+async def download(url: str, dest: Path) -> tuple[bool, str]:
+    """Stream a URL to ``dest`` atomically, under the same politeness contract as
+    every other archive request: bounded by the concurrency semaphore, polite
+    delay, and retry/backoff (honouring Retry-After) on 429/503/5xx.
+
+    Writes to ``<dest>.part`` and renames on success, so a partial download is
+    never mistaken for a complete file. Returns ``(ok, path-or-reason)``.
+    """
+    client = await get_client()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.parent / (dest.name + ".part")
+    last_exc: Exception | None = None
+    # The semaphore (and any backoff sleep) is held for the whole attempt on
+    # purpose: when the archive rate-limits us, pausing the slot throttles the
+    # overall request rate, which is the polite thing to do.
+    async with _sema():
+        for attempt in range(config.MAX_RETRIES + 1):
+            if config.REQUEST_DELAY:
+                await asyncio.sleep(config.REQUEST_DELAY)
+            try:
+                async with client.stream("GET", url) as resp:
+                    if resp.status_code in (429, 503) or 500 <= resp.status_code < 600:
+                        raise httpx.HTTPStatusError(
+                            f"retryable {resp.status_code}",
+                            request=resp.request, response=resp,
+                        )
+                    if resp.status_code not in (200, 206):
+                        return False, f"http {resp.status_code}"
+                    expected = resp.headers.get("Content-Length")
+                    with open(part, "wb") as f:
+                        async for chunk in resp.aiter_bytes(256 * 1024):
+                            f.write(chunk)
+                size = part.stat().st_size
+                if size == 0:
+                    part.unlink(missing_ok=True)
+                    return False, "empty download"
+                # Guard against a truncated stream being cached as a good file.
+                if expected and expected.isdigit() and size != int(expected):
+                    part.unlink(missing_ok=True)
+                    raise httpx.HTTPError(f"truncated download {size}/{expected} bytes")
+                os.replace(part, dest)
+                return True, str(dest)
+            except httpx.HTTPError as exc:
+                last_exc = exc
+                part.unlink(missing_ok=True)
+                if attempt >= config.MAX_RETRIES:
+                    break
+                await asyncio.sleep(_retry_delay(attempt, exc))
+    return False, f"download error: {last_exc}"

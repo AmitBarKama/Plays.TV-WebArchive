@@ -55,17 +55,40 @@ python3 -m venv .venv
   and served locally afterwards (instant seeking + replay); wipe it any time
   from the in-app **Settings** (⚙)
 
-## Status / known limitations
+## Bulk recovery (CLI)
 
-- ⚠️ **The original `.mp4` files are generally not publicly archived.** The
-  Wayback Machine captured Plays.tv profile pages, metadata and thumbnails — but
-  not the video binaries (CDX returns no `.mp4` captures). The ArchiveTeam
-  `archiveteam_playstv` WARC collection may hold them, but those items are
-  access-restricted (HTTP 401).
-- As a result, most clips show a "the archive preserved this clip's details and
-  thumbnail, but not the original video file" notice with a link to the original
-  page. The **streaming/caching layer is complete** and kicks in automatically
-  the moment any clip's video URL resolves (e.g. if ArchiveTeam access opens up).
+To recover clips for specific users in batch — resumable, polite, logged — use
+the scraper:
+
+```bash
+./scrape.sh <username> [more usernames…] [options]
+./scrape.sh --users-file handles.txt --out-dir data/recovered
+```
+
+For each user it discovers the archived clips, probes the Wayback Machine for
+each clip's `.mp4`, and downloads the ones that survive — logging the (many)
+misses, never crashing. Progress is **checkpointed to disk**, so a re-run skips
+work already done and doesn't re-download.
+
+Useful flags: `--concurrency N` (default 3 — keep it low and polite), `--delay S`
+(pause before each archive request, default 0.5s), `--limit N` (cap clips/user),
+`--metadata-only` (record media URLs without downloading), `--refresh` (ignore
+cache freshness), `--retry-misses` (re-probe clips previously found to have no
+media). Recovered files land in `--out-dir` (default `data/recovered/`) with a
+`manifest.json` summary; logs go to `--log-file` (default `data/scrape.log`).
+
+## Status / what survives
+
+- ✅ Profile pages, metadata, thumbnails, and follower/following lists are
+  reliably archived.
+- ⚠️ **Video files: a minority survive.** Most clips' `.mp4`s were never captured,
+  but some *are* archived and fetchable from the Wayback Machine (verified — real,
+  playable MP4s recovered). The app probes `…/processed/{quality}.mp4` across
+  qualities and both CDN shards; recovered clips play and download, while the rest
+  show a "thumbnail preserved, original video not archived" notice. **Expect a low
+  hit rate — mostly gaps.**
+- ArchiveTeam's `archiveteam_playstv` WARCs may hold more, but those items are
+  access-restricted (HTTP 401), so the public Wayback Machine is the source.
 
 ## Layout
 
@@ -76,10 +99,12 @@ app/
   parser.py      # JSON-LD + video-list parsing; username + follower/following lists
   cache.py       # SQLite cache (users, videos, streams, connections)
   videocache.py  # on-demand download-to-temp video cache (serve locally, clearable)
-  service.py     # orchestration — the only module the API talks to
+  service.py     # orchestration — the web app + CLI both talk to this
+  scrape.py      # resumable bulk recovery CLI (python -m app.scrape)
   main.py        # FastAPI routes + streaming + static frontend
 frontend/        # index.html, styles.css, app.js (vanilla JS, no build step)
-data/            # cache.sqlite + video_cache/ (created at runtime; git-ignored)
+run.sh           # start the web app          scrape.sh  # run the bulk scraper
+data/            # cache.sqlite + video_cache/ + recovered/ (runtime; git-ignored)
 ```
 
 ## API
