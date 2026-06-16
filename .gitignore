@@ -1,0 +1,14 @@
+# Python virtualenv
+.venv/
+venv/
+
+# Bytecode
+__pycache__/
+*.py[cod]
+
+# Runtime data: SQLite cache + downloaded video cache
+data/
+
+# OS / editor cruft
+.DS_Store
+*.swp

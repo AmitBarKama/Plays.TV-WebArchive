@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>memoryTV — recover deleted Plays.tv clips</title>
+  <link rel="preconnect" href="https://web.archive.org" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="bg-grid"></div>
+
+  <button class="settings-btn" id="settings-btn" title="Settings" aria-label="Settings">
+    <svg viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M19.14 12.94a7.49 7.49 0 0 0 .05-.94 7.49 7.49 0 0 0-.05-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7 7 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54a7 7 0 0 0-1.62.94l-2.39-.96a.5.5 0 0 0-.61.22L2.74 8.2a.5.5 0 0 0 .12.64l2.03 1.58a7.49 7.49 0 0 0 0 1.88l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32a.5.5 0 0 0 .61.22l2.39-.96a7 7 0 0 0 1.62.94l.36 2.54a.5.5 0 0 0 .5.42h3.84a.5.5 0 0 0 .5-.42l.36-2.54a7 7 0 0 0 1.62-.94l2.39.96a.5.5 0 0 0 .61-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/></svg>
+  </button>
+
+  <header class="hero" id="hero">
+    <div class="hero-inner">
+      <h1 class="brand" id="brand" title="Back to search">memory<span>TV</span></h1>
+      <p class="tagline">Plays.tv shut down in 2019. Type a username and recover their clips —
+        <strong>including the ones that were deleted</strong> — straight from the archive.</p>
+
+      <div class="search-wrap">
+        <div class="search-box">
+          <svg class="search-icon" viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 5 1.5-1.5-5-5zm-6 0A4.5 4.5 0 1 1 14 9.5 4.49 4.49 0 0 1 9.5 14z"/></svg>
+          <input id="search" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="Enter a Plays.tv username…  (e.g. MLdini)" />
+          <div class="spinner" id="search-spinner" hidden></div>
+          <button class="go-btn" id="search-go" title="Search">Search</button>
+        </div>
+        <ul class="suggestions" id="suggestions" hidden></ul>
+      </div>
+      <p class="hint">Don't remember the exact name? Start typing — matches show up with their avatars.</p>
+    </div>
+  </header>
+
+  <main id="results" class="results" hidden></main>
+
+  <!-- Video modal -->
+  <div class="modal" id="modal" hidden>
+    <div class="modal-backdrop" data-close></div>
+    <div class="modal-card">
+      <button class="modal-close" data-close aria-label="Close">&times;</button>
+      <button class="modal-nav prev" id="modal-prev" data-nav="-1" aria-label="Previous clip"><span class="nav-ico">&#8249;</span></button>
+      <button class="modal-nav next" id="modal-next" data-nav="1" aria-label="Next clip"><span class="nav-ico">&#8250;</span></button>
+      <video id="player" controls playsinline></video>
+      <div class="modal-meta">
+        <h3 id="modal-title"></h3>
+        <div class="modal-actions">
+          <span id="modal-sub" class="muted"></span>
+          <a id="modal-dl" class="btn btn-primary" download>Download .mp4</a>
+        </div>
+      </div>
+      <div class="modal-loading" id="modal-loading">Locating the file in the archive…</div>
+    </div>
+  </div>
+
+  <!-- Followers / following panel -->
+  <div class="conn" id="conn" hidden>
+    <div class="modal-backdrop" data-close></div>
+    <div class="conn-card">
+      <button class="modal-close" data-close aria-label="Close">&times;</button>
+      <h3 id="conn-title">Followers</h3>
+      <div class="conn-list" id="conn-list"></div>
+    </div>
+  </div>
+
+  <!-- Settings panel -->
+  <div class="settings" id="settings" hidden>
+    <div class="modal-backdrop" data-close></div>
+    <div class="settings-card">
+      <button class="modal-close" data-close aria-label="Close">&times;</button>
+      <h3>Settings</h3>
+      <div class="settings-section">
+        <h4>Cached videos</h4>
+        <p class="muted">Clips you watch are downloaded to a temp folder so seeking
+          and re-watching are instant. Clear it any time to free up disk space.</p>
+        <div class="settings-row">
+          <span id="cache-stats" class="muted">Loading…</span>
+          <button id="cache-clear" class="btn">Delete cached videos</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer class="foot">
+    <span>Recovers publicly-archived gameplay clips via the Internet Archive Wayback Machine &amp; ArchiveTeam.</span>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

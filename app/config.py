@@ -1,0 +1,44 @@
+"""Central configuration for the Plays.tv recovery service."""
+from pathlib import Path
+
+# Where the SQLite cache lives.
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR.mkdir(exist_ok=True)
+DB_PATH = DATA_DIR / "cache.sqlite"
+
+# On-demand video cache: clips are downloaded here on first play, then served
+# locally (instant seeking + replay). Wiped manually from the site settings.
+VIDEO_CACHE_DIR = DATA_DIR / "video_cache"
+VIDEO_CACHE_DIR.mkdir(exist_ok=True)
+
+# Wayback Machine endpoints.
+CDX_API = "https://web.archive.org/cdx/search/cdx"
+WAYBACK = "https://web.archive.org/web"
+
+# Politeness / reliability knobs for hitting the archive.
+MAX_CONCURRENCY = 8          # simultaneous requests to web.archive.org
+REQUEST_TIMEOUT = 20.0       # seconds per request (so a slow capture can't hang us)
+MAX_RETRIES = 2              # retries on 429/5xx (kept low so failures surface fast)
+BACKOFF_BASE = 0.8           # exponential backoff base (seconds)
+
+# Hard ceiling on how long we'll hunt for a video file before giving up.
+# (Most Plays.tv video files were never archived, so keep this short.)
+STREAM_RESOLVE_DEADLINE = 8.0   # seconds
+
+# Autocomplete is best-effort; if CDX is slow for a common prefix, give up and
+# let the user just open exactly what they typed. CDX latency swings a lot, so
+# allow headroom — the UI streams similar names in when they arrive and always
+# offers "open exactly what you typed" immediately, so the wait never blocks.
+SEARCH_DEADLINE = 10.0   # seconds
+
+USER_AGENT = (
+    "Mozilla/5.0 (compatible; PlaysTV-Recovery/1.0; "
+    "+archival recovery of public Plays.tv gameplay clips)"
+)
+
+# How long a cached user video-index stays fresh before we re-scrape (seconds).
+INDEX_TTL = 60 * 60 * 24 * 7   # 1 week
+
+# Video qualities to try, best first.
+QUALITIES = ["1080", "720", "480", "360", "240"]
+DEFAULT_QUALITY = "720"
