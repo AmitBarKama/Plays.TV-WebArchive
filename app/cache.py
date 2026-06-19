@@ -67,6 +67,25 @@ def _connect() -> sqlite3.Connection:
                 fetched_at  REAL,
                 PRIMARY KEY (username, kind)
             );
+
+            -- Phase 0 instrumentation: one row per recovery attempt, so a low
+            -- hit-rate can later be split into true-loss vs. pipeline blind-spot.
+            CREATE TABLE IF NOT EXISTS attempt_log (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                clip_id         TEXT,          -- canonical CDN id (when known)
+                feed_id         TEXT,          -- app-internal alias
+                url_pattern     TEXT NOT NULL, -- pattern NAME (e.g. 'legacy_profile')
+                url_tried       TEXT,
+                timestamp_tried TEXT,          -- Wayback 14-digit ts, if any
+                outcome         TEXT NOT NULL, -- hit_*|miss_*|error_*|circuit_open
+                http_status     INTEGER,
+                bytes_len       INTEGER,
+                latency_ms      INTEGER,
+                created_at      REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_attempt_clip    ON attempt_log(clip_id);
+            CREATE INDEX IF NOT EXISTS idx_attempt_outcome ON attempt_log(outcome);
+            CREATE INDEX IF NOT EXISTS idx_attempt_pattern ON attempt_log(url_pattern);
             """
         )
         _conn.commit()
@@ -263,3 +282,95 @@ def put_connections(
 
 def is_fresh(last_indexed: float | None) -> bool:
     return last_indexed is not None and (time.time() - last_indexed) < config.INDEX_TTL
+
+
+# --- Phase 0: recovery instrumentation ---------------------------------------
+
+def log_attempt(
+    url_pattern: str,
+    outcome: str,
+    *,
+    clip_id: str | None = None,
+    feed_id: str | None = None,
+    url_tried: str | None = None,
+    timestamp_tried: str | None = None,
+    http_status: int | None = None,
+    bytes_len: int | None = None,
+    latency_ms: int | None = None,
+) -> None:
+    """Fire-and-forget per-attempt recovery outcome.
+
+    Instrumentation MUST NOT raise into the fetch path — measurement never
+    breaks resolution. Lets ``loss_split()`` later separate clips that are
+    genuinely not archived (true-loss) from clips our pipeline simply failed
+    to find (blind-spot). See planning-artifacts/phase-0-1-plan.md.
+    """
+    try:
+        with _lock:
+            c = _connect()
+            c.execute(
+                """INSERT INTO attempt_log
+                   (clip_id, feed_id, url_pattern, url_tried, timestamp_tried,
+                    outcome, http_status, bytes_len, latency_ms, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (clip_id, feed_id, url_pattern, url_tried, timestamp_tried,
+                 outcome, http_status, bytes_len, latency_ms, time.time()),
+            )
+            c.commit()
+    except Exception:
+        pass
+
+
+def classify_outcome(
+    status: int | None, body_len: int | None, content_type: str | None = None
+) -> str:
+    """Map an HTTP result to an attempt_log outcome (error/miss axis only).
+
+    The caller decides hit *quality* (hit_full|hit_preview|hit_thumb) from the
+    pattern it tried; this only classifies failures and bare hits.
+    """
+    if status == 404:
+        return "miss_404"
+    if status in (401, 403):
+        return "miss_forbidden"
+    if status == 429:
+        return "circuit_open"
+    if status and status >= 500:
+        return f"error_http_{status}"
+    if status == 200 and body_len:
+        return "hit"
+    return f"error_unknown_{status}"
+
+
+def loss_split() -> dict:
+    """The Phase-1 measurement: true-loss vs. blind-spot over attempt_log.
+
+    true_loss            = clips that missed on EVERY pattern tried
+    blind_spot_recovered = clips a non-'legacy_profile' pattern hit but the
+                           old single-snapshot path ('legacy_profile') missed
+    Caveat (see Murat's plan): exclude clips whose attempt set contains any
+    unreachable outcome (error_*/circuit_open) before trusting true_loss.
+    """
+    with _lock:
+        c = _connect()
+        row = c.execute(
+            """WITH per_clip AS (
+                 SELECT clip_id,
+                   MAX(outcome LIKE 'hit%') AS any_hit,
+                   MAX(CASE WHEN url_pattern = 'legacy_profile'
+                             AND outcome LIKE 'hit%' THEN 1 ELSE 0 END) AS legacy_hit,
+                   MAX(CASE WHEN url_pattern <> 'legacy_profile'
+                             AND outcome LIKE 'hit%' THEN 1 ELSE 0 END) AS tier1_hit
+                 FROM attempt_log
+                 WHERE clip_id IS NOT NULL
+                 GROUP BY clip_id
+               )
+               SELECT
+                 SUM(CASE WHEN any_hit = 0 THEN 1 ELSE 0 END) AS true_loss,
+                 SUM(CASE WHEN tier1_hit = 1 AND legacy_hit = 0 THEN 1 ELSE 0 END)
+                   AS blind_spot_recovered,
+                 SUM(CASE WHEN any_hit = 1 THEN 1 ELSE 0 END) AS recoverable_total,
+                 COUNT(*) AS clips_total
+               FROM per_clip""",
+        ).fetchone()
+    return dict(row) if row else {}
