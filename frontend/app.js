@@ -737,89 +737,41 @@ function closeConnections() { connEl.hidden = true; }
 connEl.addEventListener("click", (e) => { if (e.target.dataset.close !== undefined) closeConnections(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !connEl.hidden) closeConnections(); });
 
-// ---------- settings / video cache ----------
-
-const settingsEl = $("#settings");
-const cacheStatsEl = $("#cache-stats");
-const cacheClearBtn = $("#cache-clear");
-
-function fmtBytes(b) {
-  if (!b) return "0 MB";
-  const mb = b / (1024 * 1024);
-  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(mb < 10 ? 1 : 0)} MB`;
-}
-
-function renderCacheStats(s) {
-  if (!s || !s.count) {
-    cacheStatsEl.textContent = "No videos cached yet";
-    cacheClearBtn.disabled = true;
-    return;
-  }
-  const dl = s.downloading ? ` (${s.downloading} downloading)` : "";
-  cacheStatsEl.textContent =
-    `${s.count} clip${s.count === 1 ? "" : "s"} · ${fmtBytes(s.bytes)}${dl}`;
-  cacheClearBtn.disabled = false;
-}
-
-async function loadCacheStats() {
-  cacheStatsEl.textContent = "Loading…";
-  try {
-    const r = await fetch("/api/cache");
-    renderCacheStats(await r.json());
-  } catch (e) {
-    cacheStatsEl.textContent = "Couldn’t read cache info";
-    cacheClearBtn.disabled = true;
-  }
-}
-
-async function clearCache() {
-  cacheClearBtn.disabled = true;
-  cacheStatsEl.textContent = "Clearing…";
-  try {
-    await fetch("/api/cache", { method: "DELETE" });
-    await loadCacheStats();
-    cacheStatsEl.textContent = "Cache cleared · " + cacheStatsEl.textContent;
-  } catch (e) {
-    cacheStatsEl.textContent = "Couldn’t clear the cache";
-  }
-}
-
-function openSettings() { settingsEl.hidden = false; loadCacheStats(); }
-function closeSettings() { settingsEl.hidden = true; }
-
-const settingsBtn = $("#settings-btn");
-if (settingsBtn) settingsBtn.addEventListener("click", openSettings);
-cacheClearBtn.addEventListener("click", clearCache);
-settingsEl.addEventListener("click", (e) => { if (e.target.dataset.close !== undefined) closeSettings(); });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !settingsEl.hidden) closeSettings(); });
-
-// ---------- theme (light / dark / auto) ----------
-// The remembered theme is applied pre-paint by an inline <head> script (no FOUC);
-// here we just wire the pill, keep it in sync, and live-follow the OS on "auto".
+// ---------- theme toggle (one button: dark <-> light) ----------
+// First visit follows the OS (applied pre-paint by the <head> script); after
+// that the button sets an explicit choice. The icon reflects the current theme.
 const THEME_KEY = "mtv-theme";
-const themePill = $("#theme-pill");
+const themeToggle = $("#theme-toggle");
+const THEME_ICON = {
+  sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>',
+  moon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>',
+};
 
-function sysTheme() {
-  return matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+function currentTheme() {
+  return document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
 }
-function applyTheme(pref) {
-  const resolved = pref === "auto" ? sysTheme() : pref;
-  document.documentElement.setAttribute("data-theme", resolved);
-  document.documentElement.setAttribute("data-theme-pref", pref);
-  if (themePill)
-    [...themePill.children].forEach((b) =>
-      b.setAttribute("aria-pressed", String(b.dataset.pref === pref)));
-  try { localStorage.setItem(THEME_KEY, pref); } catch (e) { /* private mode */ }
+function renderThemeToggle() {
+  if (!themeToggle) return;
+  const t = currentTheme();
+  themeToggle.innerHTML = t === "dark" ? THEME_ICON.moon : THEME_ICON.sun;
+  themeToggle.title = t === "dark" ? "Switch to light mode" : "Switch to dark mode";
 }
-if (themePill)
-  themePill.addEventListener("click", (e) => {
-    const b = e.target.closest("button");
-    if (b) applyTheme(b.dataset.pref);
-  });
-matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
-  if ((localStorage.getItem(THEME_KEY) || "auto") === "auto") applyTheme("auto");
+function setTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  try { localStorage.setItem(THEME_KEY, theme); } catch (e) { /* private mode */ }
+  renderThemeToggle();
+}
+if (themeToggle)
+  themeToggle.addEventListener("click", () =>
+    setTheme(currentTheme() === "dark" ? "light" : "dark"));
+// Until the user makes an explicit choice, keep following the OS live.
+matchMedia("(prefers-color-scheme: light)").addEventListener("change", (e) => {
+  if (!localStorage.getItem(THEME_KEY)) {
+    document.documentElement.setAttribute("data-theme", e.matches ? "light" : "dark");
+    renderThemeToggle();
+  }
 });
-applyTheme(localStorage.getItem(THEME_KEY) || "auto");
+renderThemeToggle();
 
 // ---------- channel-tuning landing: self-typing example + idle resume ----------
 // The username is typed straight into the page (no search box). When idle, an

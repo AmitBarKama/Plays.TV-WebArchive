@@ -373,55 +373,23 @@ body.modal-open .scanlines, body.modal-open .vignette, body.modal-open .bg-grid 
   .modal-nav { width: 40px; height: 40px; font-size: 22px; }
 }
 
-/* ---------- theme switch (Light / Dark / Auto) ---------- */
-.theme-pill {
-  position: fixed; top: 18px; right: 66px; z-index: 41;
-  display: inline-flex; background: var(--card); border: 1px solid var(--line);
-  border-radius: 999px; padding: 3px; gap: 2px; box-shadow: var(--shadow);
+/* ---------- top-right actions: theme toggle + GitHub ---------- */
+.top-actions {
+  position: fixed; top: 16px; right: 18px; z-index: 41;
+  display: flex; align-items: center; gap: 8px;
 }
-.theme-pill button {
-  border: 0; background: none; color: var(--muted); cursor: pointer;
-  font: inherit; font-size: 13px; font-weight: 600; padding: 6px 11px; border-radius: 999px;
-  display: inline-flex; align-items: center; gap: 6px; transition: color .15s, background .15s;
-}
-.theme-pill button .lbl { }
-.theme-pill button:hover { color: var(--text); }
-.theme-pill button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); }
-[data-theme="dark"] .theme-pill button[aria-pressed="true"] { color: var(--accent); }
-
-/* ---------- settings ---------- */
-.settings-btn {
-  position: fixed; top: 16px; right: 18px; z-index: 40;
+.icon-btn {
   width: 40px; height: 40px; border-radius: 50%;
   display: grid; place-items: center; cursor: pointer;
   background: var(--card); border: 1px solid var(--line); color: var(--muted);
-  transition: color .15s, border-color .15s, transform .2s;
+  transition: color .15s, border-color .15s, transform .15s;
 }
-.settings-btn:hover { color: var(--text); border-color: var(--accent); transform: rotate(40deg); }
-
-.settings { position: fixed; inset: 0; z-index: 110; display: grid; place-items: center; padding: 20px; }
-.settings[hidden] { display: none; }
-.settings-card {
-  position: relative; z-index: 2; width: min(520px, 96vw);
-  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
-  box-shadow: var(--shadow); padding: 24px 26px 26px;
-}
-.settings-card h3 { margin: 0 0 18px; font-size: 20px; }
-.settings-section h4 { margin: 0 0 6px; font-size: 15px; }
-.settings-section p { margin: 0 0 16px; font-size: 13px; line-height: 1.5; }
-.settings-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
-#cache-stats { font-size: 14px; }
-#cache-clear { border-color: color-mix(in srgb, var(--danger) 40%, transparent); color: var(--danger); }
-#cache-clear:hover { background: var(--danger-tint); }
-#cache-clear[disabled] { opacity: .5; cursor: default; filter: none; }
+.icon-btn:hover { color: var(--text); border-color: var(--accent); transform: translateY(-1px); }
+.icon-btn svg { width: 20px; height: 20px; display: block; }
 
 .foot { position: relative; z-index: 1; text-align: center; color: var(--faint); font-size: 12px; padding: 20px; }
 
 @media (max-width: 560px) {
   .grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
   .user-head { flex-direction: column; text-align: center; }
-  /* condense the theme pill to icons so it fits beside the gear */
-  .theme-pill { top: 14px; right: 60px; }
-  .theme-pill button { padding: 6px 8px; }
-  .theme-pill button .lbl { display: none; }
 }
