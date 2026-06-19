@@ -12,9 +12,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY frontend ./frontend
 
-# Persistent state goes on a mounted volume in production (see DEPLOY.md).
+# Persistent state goes on a mounted volume in production. On Railway, attach a
+# Volume at /data in the dashboard (the Docker VOLUME instruction is unsupported
+# there); the app creates /data itself if it's missing. See DEPLOY.md.
 ENV MEMORYTV_DATA_DIR=/data
-VOLUME ["/data"]
 
 # Hosts inject $PORT; default to 8000 for local `docker run`.
 ENV PORT=8000
