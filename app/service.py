@@ -7,6 +7,7 @@ only — the routes and frontend stay the same.
 from __future__ import annotations
 
 import asyncio
+import re
 
 from . import cache, config, parser, wayback
 from .parser import Profile, Video
@@ -257,12 +258,31 @@ async def get_connections(username: str, kind: str) -> dict:
 
 # --- stream / download resolution -------------------------------------------
 
-async def resolve_stream(feed_id: str, retry_miss: bool = False) -> str | None:
-    """Return a working archived .mp4 URL for a video, trying qualities.
+# The short, silent hover-preview loop. When the full clip wasn't archived this
+# is often still there — a few seconds of real motion, far better than a frozen
+# thumbnail. Resolved as a last resort and tagged so the UI can label it.
+PREVIEW_NAME = "preview_144.mp4"
+PREVIEW_QUALITY = "preview"
 
-    Verified through CDX so we only ever hand the player a URL that exists.
-    Cached after first resolution. Pass ``retry_miss=True`` to re-probe a clip
-    previously cached as having no media (e.g. the archive captured it since).
+# Filename at the tail of a .../processed/<file> capture URL.
+_PROCESSED_FILE_RE = re.compile(r"/processed/([^/?#]+)$")
+_CDN_HOSTS = ("d0playscdntv-a.akamaihd.net", "d1playscdntv-a.akamaihd.net")
+
+
+async def resolve_stream(feed_id: str, retry_miss: bool = False) -> str | None:
+    """Return a working archived video URL for a clip, best quality first.
+
+    A single CDX *prefix* query lists every file archived under the clip's
+    ``/processed/`` directory — all qualities, the preview loop, the thumbnails —
+    in one request. We then pick the best available: the full clip by quality,
+    else the silent preview loop. This replaced a 12-probe-per-clip fan-out
+    (5 qualities x 2 hosts + preview) whose request burst got us throttled by
+    web.archive.org — the single biggest cause of the old ~2.5% hit rate.
+
+    A miss is cached only when a query *succeeded* and the directory genuinely
+    held no video. If every host came back throttled (``CdxUnavailable``), the
+    clip is left unresolved so a later visit can re-probe — never frozen into the
+    cache as a false gap. Pass ``retry_miss=True`` to re-probe a cached miss.
     """
     cached = cache.get_stream(feed_id)
     if cached and (cached["archived_url"] or not retry_miss):
@@ -271,43 +291,66 @@ async def resolve_stream(feed_id: str, retry_miss: bool = False) -> str | None:
     v = cache.get_video(feed_id)
     if not v or not v["cdn_id"]:
         return None
+    cdn_id = v["cdn_id"]
 
-    hosts = [v["cdn_host"]] if v["cdn_host"] else []
-    # CDN was sharded across d0/d1; try both in case capture used the other.
-    for alt in ("d0playscdntv-a.akamaihd.net", "d1playscdntv-a.akamaihd.net"):
-        if alt not in hosts:
-            hosts.append(alt)
+    # The clip's files live on the host its thumbnail came from; query that first
+    # and only fall back to the other shard if the query was throttled.
+    primary = v["cdn_host"] or _CDN_HOSTS[1]
+    order = [primary] + [h for h in _CDN_HOSTS if h != primary]
 
-    async def probe(quality: str, host: str) -> tuple[int, str] | None:
-        original = f"http://{host}/video/{v['cdn_id']}/processed/{quality}.mp4"
-        cap = await wayback.find_capture(original)
-        if cap:
-            ts, orig = cap
-            return config.QUALITIES.index(quality), f"{config.WAYBACK}/{ts}id_/{orig}"
-        return None
+    async def list_dir(host: str) -> list[list[str]] | None:
+        """Captures under this clip's /processed/ dir, or None if throttled."""
+        try:
+            return await wayback.cdx(
+                f"http://{host}/video/{cdn_id}/processed/",
+                matchType="prefix", collapse="urlkey",
+                fl="timestamp,original,statuscode", limit="250",
+            )
+        except wayback.CdxUnavailable:
+            return None
 
-    # Probe every quality/host combination in parallel, bounded by a deadline.
-    tasks = [asyncio.create_task(probe(q, h))
-             for q in config.QUALITIES for h in hosts]
-    best: tuple[int, str] | None = None
-    try:
-        for coro in asyncio.as_completed(tasks, timeout=config.STREAM_RESOLVE_DEADLINE):
-            res = await coro
-            if res and (best is None or res[0] < best[0]):
-                best = res  # prefer higher quality (lower index)
-    except asyncio.TimeoutError:
-        pass
-    finally:
-        # On timeout, cancel the still-running probes so they stop hitting the
-        # archive and free their concurrency slots immediately.
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+    rows: list[list[str]] | None = None
+    any_listed = False
+    for host in order:
+        r = await list_dir(host)
+        if r is None:
+            continue            # throttled this host
+        any_listed = True
+        if r:                   # real listing (thumbnails are ~always present)
+            rows = r
+            break
+    if rows is None:
+        if not any_listed:
+            return None         # every host throttled — don't poison the cache
+        rows = []               # hosts answered, dir is empty — a real miss
 
-    if best:
-        cache.put_stream(feed_id, config.QUALITIES[best[0]], best[1])
-        return best[1]
-    # Remember the miss so we fail instantly next time instead of re-hunting.
+    # filename -> (timestamp, original) for playable (200 / revisit) captures.
+    avail: dict[str, tuple[str, str]] = {}
+    for row in rows[1:]:        # row[0] is the CDX header
+        if len(row) < 3:
+            continue
+        ts, original, status = row[0], row[1], row[2]
+        if status not in ("200", "-"):
+            continue
+        m = _PROCESSED_FILE_RE.search(original)
+        if m:
+            avail.setdefault(m.group(1), (ts, original))
+
+    chosen: tuple[str, tuple[str, str]] | None = None
+    for q in config.QUALITIES:                    # full clip, best quality first
+        if f"{q}.mp4" in avail:
+            chosen = (q, avail[f"{q}.mp4"])
+            break
+    if chosen is None and PREVIEW_NAME in avail:  # else the silent preview loop
+        chosen = (PREVIEW_QUALITY, avail[PREVIEW_NAME])
+
+    if chosen:
+        quality, (ts, original) = chosen
+        url = f"{config.WAYBACK}/{ts}id_/{original}"
+        cache.put_stream(feed_id, quality, url)
+        return url
+
+    # Directory listed fine but holds no video — safe to remember the miss.
     cache.put_stream(feed_id, "", "")
     return None
 
@@ -342,8 +385,51 @@ def _user_dict(row) -> dict:
     }
 
 
+def _tier(quality: str | None) -> str | None:
+    """Map a cached stream quality to a UI tier. ``None`` = not resolved yet.
+
+    '' (cached miss) -> 'none'; the preview marker -> 'preview'; anything else
+    is a real quality -> 'full'.
+    """
+    if quality is None:
+        return None
+    if quality == "":
+        return "none"
+    return "preview" if quality == PREVIEW_QUALITY else "full"
+
+
+def search_clips(query: str, game: str | None = None, limit: int = 240) -> dict:
+    """Grid-shaped results for a search across every recovered clip (local index).
+
+    Same per-clip shape the grid already renders, plus ``username`` so a result
+    card can link back to whoever made it. No archive call — searches only what
+    has already been recovered.
+    """
+    rows = cache.search_clips(query, game=game, limit=limit)
+    videos = [{
+        "feed_id": r["feed_id"],
+        "username": r["username"],
+        "title": r["title"] or "(untitled)",
+        "game": r["game"],
+        "date": r["upload_date"] or (r["month"] + "-01" if r["month"] else None),
+        "duration": r["duration"],
+        "deleted": bool(r["deleted"]),
+        "thumb": thumb_url(r["cdn_host"], r["cdn_id"]),
+        "tier": _tier(r["stream_quality"]),
+        "page_url": f"https://plays.tv/video/{r['feed_id']}",
+    } for r in rows]
+    return {
+        "query": query,
+        "total": len(videos),
+        "games": sorted({r["game"] for r in rows if r["game"]}),
+        "deleted_count": sum(1 for v in videos if v["deleted"]),
+        "videos": videos,
+    }
+
+
 def _assemble(username: str, user_row) -> dict:
     rows = cache.get_videos(username)
+    tiers = cache.get_stream_qualities(username)
     videos = [{
         "feed_id": r["feed_id"],
         "title": r["title"] or "(untitled)",
@@ -352,6 +438,7 @@ def _assemble(username: str, user_row) -> dict:
         "duration": r["duration"],
         "deleted": bool(r["deleted"]),
         "thumb": thumb_url(r["cdn_host"], r["cdn_id"]),
+        "tier": _tier(tiers.get(r["feed_id"])),
         "page_url": f"https://plays.tv/video/{r['feed_id']}",
     } for r in rows]
     return {

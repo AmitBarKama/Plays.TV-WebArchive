@@ -177,6 +177,54 @@ def put_stream(feed_id: str, quality: str, archived_url: str) -> None:
         c.commit()
 
 
+def get_stream_qualities(username: str) -> dict[str, str]:
+    """feed_id -> cached stream quality for one user's clips, in a single query.
+
+    A resolved hit maps to its quality ('preview', '720', ...); a cached miss
+    maps to '' (empty string). Clips not yet resolved are absent from the map.
+    Lets the grid label tiers without a resolve round-trip per clip.
+    """
+    with _lock:
+        c = _connect()
+        rows = c.execute(
+            """SELECT s.feed_id AS fid, s.quality AS q FROM streams s
+               JOIN videos v ON v.feed_id = s.feed_id
+               WHERE v.username = ?""",
+            (username,),
+        ).fetchall()
+    return {r["fid"]: (r["q"] or "") for r in rows}
+
+
+def search_clips(
+    query: str, game: str | None = None, limit: int = 240
+) -> list[sqlite3.Row]:
+    """Search every recovered clip by title / username / game (+ optional exact game).
+
+    Pure local query over what's already been indexed — no archive round-trip.
+    Each row carries the clip's cached stream quality (``stream_quality``) so the
+    grid can tag tiers without re-resolving.
+    """
+    sql = [
+        "SELECT v.*, s.quality AS stream_quality",
+        "FROM videos v LEFT JOIN streams s ON s.feed_id = v.feed_id",
+        "WHERE 1=1",
+    ]
+    args: list = []
+    q = (query or "").strip()
+    if q:
+        like = f"%{q}%"
+        sql.append("AND (v.title LIKE ? OR v.username LIKE ? OR v.game LIKE ?)")
+        args += [like, like, like]
+    if game:
+        sql.append("AND v.game = ?")
+        args.append(game)
+    sql.append("ORDER BY COALESCE(v.upload_date, v.month) DESC LIMIT ?")
+    args.append(limit)
+    with _lock:
+        c = _connect()
+        return c.execute(" ".join(sql), args).fetchall()
+
+
 def get_connections(username: str, kind: str) -> dict | None:
     """Cached followers/following list for a user, or None if not cached."""
     with _lock:

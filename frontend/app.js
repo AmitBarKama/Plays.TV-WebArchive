@@ -72,6 +72,15 @@ function renderDropdown(query, results) {
   open.addEventListener("click", () => selectUser(query));
   suggestionsEl.appendChild(open);
 
+  // Secondary action: search across every clip already recovered.
+  const sc = el("li", "open-exact search-clips");
+  sc.innerHTML =
+    `<div class="sug-avatar go">⌕</div>` +
+    `<div><div class="sug-name">Search all clips for “${escapeHtml(query)}”</div>` +
+    `<div class="sug-sub">title, game or user across everything recovered</div></div>`;
+  sc.addEventListener("click", () => searchClips(query));
+  suggestionsEl.appendChild(sc);
+
   if (results === null) {
     suggestionsEl.appendChild(
       el("li", "searching", `<div class="spinner"></div>Finding similar names…`));
@@ -142,6 +151,7 @@ async function selectUser(username, feedId) {
   hideSuggestions();
   searchInput.value = username;
   hero.classList.add("compact");
+  twStop(); resizeAnswer();
   resultsEl.hidden = false;
   resultsEl.scrollIntoView({ behavior: "smooth", block: "start" });
   resultsEl.innerHTML = `
@@ -152,8 +162,13 @@ async function selectUser(username, feedId) {
     </div>`;
   setHash(username);
 
+  // Bound the wait: the Internet Archive can hang for minutes when it's slow/down.
+  // Fail into a clear "couldn't reach the archive" message instead of spinning forever.
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), 20000);
   try {
-    const r = await fetch(`/api/user/${encodeURIComponent(username)}/videos`);
+    const r = await fetch(`/api/user/${encodeURIComponent(username)}/videos`, { signal: ctrl.signal });
+    clearTimeout(to);
     if (r.status === 404) { renderEmpty(username); return; }
     if (!r.ok) throw new Error(`the archive responded with ${r.status}`);
     const data = await r.json();
@@ -164,7 +179,10 @@ async function selectUser(username, feedId) {
       if (v) openModal(v);
     }
   } catch (e) {
-    renderError(username, e);
+    clearTimeout(to);
+    renderError(username, e.name === "AbortError"
+      ? new Error("the archive didn’t respond in time (it may be down)")
+      : e);
   }
 }
 
@@ -229,6 +247,67 @@ function renderUser(data) {
   head.appendChild(info);
   resultsEl.appendChild(head);
 
+  resultsEl.appendChild(buildToolbar(data));
+  const grid = el("div", "grid");
+  grid.id = "grid";
+  resultsEl.appendChild(grid);
+  renderGrid();
+}
+
+// ---------- search across all recovered clips ----------
+
+async function searchClips(query) {
+  query = (query || "").trim();
+  if (!query) return;
+  hideSuggestions();
+  searchInput.value = query;
+  hero.classList.add("compact");
+  twStop(); resizeAnswer();
+  resultsEl.hidden = false;
+  resultsEl.scrollIntoView({ behavior: "smooth", block: "start" });
+  resultsEl.innerHTML =
+    `<div class="state"><div class="spinner-lg"></div>
+       <h3>Searching recovered clips for “${escapeHtml(query)}”…</h3></div>`;
+  history.replaceState(null, "", `#search/${encodeURIComponent(query)}`);
+  try {
+    const r = await fetch(`/api/clips/search?q=${encodeURIComponent(query)}`);
+    if (!r.ok) throw new Error(`search failed (${r.status})`);
+    renderClips(await r.json(), query);
+  } catch (e) { renderError(query, e); }
+}
+
+function renderClips(data, query) {
+  // Reuse the grid + toolbar by presenting the search as a pseudo-"user".
+  currentUser = {
+    username: null, isSearch: true, query,
+    videos: data.videos, recovered: data.total, deleted_count: data.deleted_count,
+  };
+  resultsEl.innerHTML = "";
+  const back = el("button", "back-btn", "← New search");
+  back.addEventListener("click", goHome);
+  resultsEl.appendChild(back);
+
+  const head = el("div", "user-head search-head");
+  const info = el("div");
+  info.appendChild(el("h2", null, `Results for “${escapeHtml(query)}”`));
+  const users = new Set(data.videos.map((v) => v.username).filter(Boolean)).size;
+  const stats = el("div", "stat-row");
+  stats.appendChild(el("div", null,
+    `<b>${data.total}</b> clip${data.total === 1 ? "" : "s"} from ` +
+    `<b>${users}</b> user${users === 1 ? "" : "s"}`));
+  if (data.deleted_count)
+    stats.appendChild(el("div", "deleted-stat", `<b>${data.deleted_count}</b> deleted`));
+  info.appendChild(stats);
+  head.appendChild(info);
+  resultsEl.appendChild(head);
+
+  if (!data.total) {
+    resultsEl.appendChild(el("div", "state",
+      `<h3>No recovered clips match “${escapeHtml(query)}”</h3>
+       <p>Search only covers clips already pulled from the archive. Recover a
+          username first, then search again.</p>`));
+    return;
+  }
   resultsEl.appendChild(buildToolbar(data));
   const grid = el("div", "grid");
   grid.id = "grid";
@@ -308,6 +387,7 @@ function renderGrid() {
 
 function card(v) {
   const c = el("div", "card");
+  c.dataset.feedId = v.feed_id;
   const thumb = el("div", "thumb");
   if (v.thumb) thumb.style.backgroundImage = `url("${v.thumb}")`;
   if (v.deleted) thumb.appendChild(el("div", "badge", "DELETED"));
@@ -325,10 +405,92 @@ function card(v) {
   sub.appendChild(el("span", "card-game", escapeHtml(v.game || "")));
   sub.appendChild(el("span", null, v.date ? v.date.slice(0, 7) : ""));
   body.appendChild(sub);
+  // In a cross-user clip search, attribute (and link to) whoever made it.
+  if (currentUser && currentUser.isSearch && v.username) {
+    const u = el("div", "card-user", "by " + escapeHtml(v.username));
+    u.addEventListener("click", (e) => { e.stopPropagation(); selectUser(v.username); });
+    body.appendChild(u);
+  }
   c.appendChild(body);
 
   c.addEventListener("click", () => openModal(v));
+
+  // Tier: known from the payload -> light it up now; unknown -> resolve lazily
+  // as the card scrolls into view (keeps the archive load bounded and polite).
+  if (v.tier) {
+    setCardTier(c, v.tier, `/api/stream/${v.feed_id}`);
+  } else {
+    c.dataset.tier = "unknown";
+    if (cardObserver) cardObserver.observe(c);
+    else { resolveQueue.push(() => resolveCard(c)); pumpResolveQueue(); }
+  }
   return c;
+}
+
+// ---------- lazy tier resolution + auto-looping preview cards ----------
+// As each card enters the viewport we ask the server for its archived source.
+// Preview-only clips auto-loop muted on the card (like Plays.tv's old hover);
+// full clips get a badge and open in the player; thumbnail-only stay as-is.
+
+const cardObserver = ("IntersectionObserver" in window)
+  ? new IntersectionObserver(onCardsVisible, { rootMargin: "300px" })
+  : null;
+
+let resolveActive = 0;
+const resolveQueue = [];
+
+function pumpResolveQueue() {
+  while (resolveActive < 4 && resolveQueue.length) {
+    const job = resolveQueue.shift();
+    resolveActive++;
+    Promise.resolve(job()).finally(() => { resolveActive--; pumpResolveQueue(); });
+  }
+}
+
+function onCardsVisible(entries, obs) {
+  let added = false;
+  entries.forEach((e) => {
+    if (!e.isIntersecting) return;
+    obs.unobserve(e.target);
+    resolveQueue.push(() => resolveCard(e.target));
+    added = true;
+  });
+  if (added) pumpResolveQueue();
+}
+
+async function resolveCard(cardEl) {
+  const feedId = cardEl.dataset.feedId;
+  if (!feedId || (cardEl.dataset.tier && cardEl.dataset.tier !== "unknown")) return;
+  if (!cardEl.isConnected) return; // grid was re-rendered (filter/sort) — skip
+  try {
+    const r = await fetch(`/api/resolve/${feedId}`);
+    const data = await r.json();
+    setCardTier(cardEl, data.tier, data.stream || `/api/stream/${feedId}`);
+  } catch (e) { cardEl.dataset.tier = "none"; }
+}
+
+function setCardTier(cardEl, tier, streamUrl) {
+  cardEl.dataset.tier = tier || "none";
+  const thumb = cardEl.querySelector(".thumb");
+  if (!thumb) return;
+  thumb.querySelectorAll(".tier-tag").forEach((n) => n.remove());
+
+  if (tier === "preview") {
+    if (!thumb.querySelector("video.preview-loop")) {
+      const vid = el("video", "preview-loop");
+      vid.muted = true; vid.loop = true; vid.autoplay = true;
+      vid.playsInline = true; vid.preload = "metadata";
+      vid.src = streamUrl;
+      vid.addEventListener("error", () => { vid.remove(); cardEl.dataset.tier = "none"; });
+      thumb.insertBefore(vid, thumb.firstChild);
+      vid.play().catch(() => {});
+    }
+    thumb.appendChild(el("div", "tier-tag preview", "PREVIEW"));
+  } else if (tier === "full") {
+    thumb.appendChild(el("div", "tier-tag full", "FULL"));
+  } else {
+    thumb.appendChild(el("div", "tier-tag none", "THUMBNAIL"));
+  }
 }
 
 // ---------- modal player ----------
@@ -341,39 +503,89 @@ const modalNext = $("#modal-next");
 
 let modalTimer = null;
 
-function openModal(v) {
+async function openModal(v) {
   modal.hidden = false;
   document.body.style.overflow = "hidden";
+  document.body.classList.add("modal-open");   // drops full-screen GPU layers (see CSS)
+  // Pause the grid's auto-looping preview clips: multiple simultaneous decodes
+  // behind the modal compete for the GPU and make playback stutter.
+  document.querySelectorAll("video.preview-loop").forEach((vid) => vid.pause());
   openVideo = v;
   currentIndex = currentList.indexOf(v);
   if (currentIndex < 0) currentIndex = currentList.findIndex((x) => x.feed_id === v.feed_id);
-  if (currentUser) setHash(currentUser.username, v.feed_id);
+  if (currentUser && currentUser.username) setHash(currentUser.username, v.feed_id);
   updateNav();
   $("#modal-title").textContent = v.title;
   $("#modal-sub").textContent = [v.game, v.date].filter(Boolean).join(" · ");
+  player.poster = v.thumb || "";
+  player.loop = false;
+  player.muted = false;
+  setModalBadge(null);
   modalLoading.hidden = false;
   modalLoading.classList.remove("err");
   modalLoading.textContent = "Locating the original video in the archive…";
-  player.poster = v.thumb || "";
-  $("#modal-dl").style.display = "";
-  $("#modal-dl").href = `/api/stream/${v.feed_id}?dl=1`;
+
+  // Tier may already be known (from the payload or the card's lazy resolve);
+  // otherwise resolve it now so we show the right player + label.
+  let tier = v.tier;
+  if (!tier) {
+    try {
+      const r = await fetch(`/api/resolve/${v.feed_id}`);
+      tier = (await r.json()).tier;
+      v.tier = tier;
+    } catch (e) { tier = null; }
+  }
+  if (openVideo !== v) return; // user navigated to another clip while resolving
+
+  if (tier === "none") { showUnarchived(v); return; }
+
+  const isPreview = tier === "preview";
+  player.loop = isPreview;     // previews are short silent loops
+  player.muted = isPreview;
+  setModalBadge(isPreview ? "preview" : "full");
+  const dl = $("#modal-dl");
+  dl.style.display = "";
+  dl.href = `/api/stream/${v.feed_id}?dl=1`;
+  dl.textContent = isPreview ? "Download preview .mp4" : "Download .mp4";
   player.src = `/api/stream/${v.feed_id}`;
   player.play().catch(() => {});
 
-  const fail = () => {
-    clearTimeout(modalTimer);
-    modalLoading.hidden = false;
-    modalLoading.classList.add("err");
-    modalLoading.innerHTML =
-      `<div>The archive preserved this clip's details and thumbnail, but not the original video file.` +
-      `&nbsp;<a href="${v.page_url}" target="_blank" rel="noopener">View original page ↗</a></div>`;
-    document.getElementById("modal-dl").style.display = "none";
-  };
   player.oncanplay = () => { clearTimeout(modalTimer); modalLoading.hidden = true; };
-  player.onerror = fail;
+  player.onerror = () => showUnarchived(v);
   // Safety net: if neither canplay nor error fires (very slow archive), give up.
   clearTimeout(modalTimer);
-  modalTimer = setTimeout(fail, 25000);
+  modalTimer = setTimeout(() => showUnarchived(v), 25000);
+}
+
+// The full video for this clip wasn't archived — keep the page honest.
+function showUnarchived(v) {
+  clearTimeout(modalTimer);
+  player.pause();
+  player.removeAttribute("src");
+  player.load();
+  setModalBadge(null);
+  modalLoading.hidden = false;
+  modalLoading.classList.add("err");
+  modalLoading.innerHTML =
+    `<div>The archive preserved this clip's details and thumbnail, but not the original video file.` +
+    `&nbsp;<a href="${v.page_url}" target="_blank" rel="noopener">View original page ↗</a></div>`;
+  $("#modal-dl").style.display = "none";
+}
+
+function setModalBadge(tier) {
+  const b = $("#modal-badge");
+  if (!b) return;
+  if (tier === "preview") {
+    b.hidden = false;
+    b.className = "modal-badge preview";
+    b.textContent = "PREVIEW · silent loop · full video not archived";
+  } else if (tier === "full") {
+    b.hidden = false;
+    b.className = "modal-badge full";
+    b.textContent = "FULL VIDEO";
+  } else {
+    b.hidden = true;
+  }
 }
 
 function closeModal() {
@@ -383,8 +595,10 @@ function closeModal() {
   player.removeAttribute("src");
   player.load();
   document.body.style.overflow = "";
+  document.body.classList.remove("modal-open");
+  document.querySelectorAll("video.preview-loop").forEach((vid) => vid.play().catch(() => {}));
   openVideo = null;
-  if (currentUser) setHash(currentUser.username);
+  if (currentUser && currentUser.username) setHash(currentUser.username);
 }
 
 // Move to the previous/next clip in the currently displayed (filtered) list.
@@ -465,7 +679,7 @@ function goHome() {
   currentList = [];
   currentIndex = -1;
   history.replaceState(null, "", location.pathname);
-  searchInput.focus();
+  landingReset();
 }
 
 const brandEl = $("#brand");
@@ -579,10 +793,96 @@ cacheClearBtn.addEventListener("click", clearCache);
 settingsEl.addEventListener("click", (e) => { if (e.target.dataset.close !== undefined) closeSettings(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !settingsEl.hidden) closeSettings(); });
 
+// ---------- theme (light / dark / auto) ----------
+// The remembered theme is applied pre-paint by an inline <head> script (no FOUC);
+// here we just wire the pill, keep it in sync, and live-follow the OS on "auto".
+const THEME_KEY = "mtv-theme";
+const themePill = $("#theme-pill");
+
+function sysTheme() {
+  return matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+function applyTheme(pref) {
+  const resolved = pref === "auto" ? sysTheme() : pref;
+  document.documentElement.setAttribute("data-theme", resolved);
+  document.documentElement.setAttribute("data-theme-pref", pref);
+  if (themePill)
+    [...themePill.children].forEach((b) =>
+      b.setAttribute("aria-pressed", String(b.dataset.pref === pref)));
+  try { localStorage.setItem(THEME_KEY, pref); } catch (e) { /* private mode */ }
+}
+if (themePill)
+  themePill.addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (b) applyTheme(b.dataset.pref);
+  });
+matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+  if ((localStorage.getItem(THEME_KEY) || "auto") === "auto") applyTheme("auto");
+});
+applyTheme(localStorage.getItem(THEME_KEY) || "auto");
+
+// ---------- channel-tuning landing: self-typing example + idle resume ----------
+// The username is typed straight into the page (no search box). When idle, an
+// example types/deletes through a roster so it's obvious where to type; it stands
+// down the moment the user focuses/types, and resumes after 20s of stillness.
+const answerLine = $("#answer-line");
+const TW_NAMES = ["Smaf", "MaxTotal", "Tikwikman", "Slappy", "RonBotic", "Mldini"];
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+// Hidden sizer so the inline input hugs its text — the cursor sits right after it.
+const answerSizer = document.createElement("span");
+answerSizer.style.cssText = "position:absolute;visibility:hidden;white-space:pre;left:-9999px;top:0;";
+document.body.appendChild(answerSizer);
+function resizeAnswer() {
+  const cs = getComputedStyle(searchInput);
+  answerSizer.style.fontFamily = cs.fontFamily;
+  answerSizer.style.fontSize = cs.fontSize;
+  answerSizer.style.fontWeight = cs.fontWeight;
+  answerSizer.style.letterSpacing = cs.letterSpacing;
+  answerSizer.textContent = searchInput.value || searchInput.placeholder || "";
+  searchInput.style.width = (answerSizer.offsetWidth + 2) + "px";
+}
+
+let twName = 0, twChar = 0, twDel = false, twTimer = null, idleTimer = null;
+function twStop() { if (twTimer) { clearTimeout(twTimer); twTimer = null; } }
+function twTick() {
+  if (searchInput.value) { twStop(); return; }       // user typed — stand down
+  const w = TW_NAMES[twName];
+  searchInput.placeholder = w.slice(0, twChar);
+  resizeAnswer();
+  let delay;
+  if (!twDel) { if (twChar < w.length) { twChar++; delay = 95; } else { twDel = true; delay = 1400; } }
+  else { if (twChar > 0) { twChar--; delay = 45; } else { twDel = false; twName = (twName + 1) % TW_NAMES.length; delay = 450; } }
+  twTimer = setTimeout(twTick, delay);
+}
+function twStart() {
+  if (reduceMotion || twTimer || hero.classList.contains("compact") || searchInput.value) return;
+  twDel = false; twChar = 0; twTick();
+}
+function resetIdle() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    if (!searchInput.value && document.activeElement === searchInput) twStart();
+  }, 20000);
+}
+function landingReset() {            // return to the landing: clear + play the demo
+  twStop(); searchInput.value = ""; searchInput.placeholder = ""; resizeAnswer();
+  if (reduceMotion) { searchInput.placeholder = "e.g. Smaf, MaxTotal, Tikwikman, Slappy, RonBotic, Mldini"; resizeAnswer(); }
+  else twStart();
+}
+
+searchInput.addEventListener("focus", () => { twStop(); searchInput.placeholder = ""; resizeAnswer(); resetIdle(); });
+searchInput.addEventListener("blur", () => { clearTimeout(idleTimer); if (!searchInput.value) { searchInput.placeholder = ""; twStart(); } });
+searchInput.addEventListener("input", () => { twStop(); resetIdle(); resizeAnswer(); });
+searchInput.addEventListener("keydown", resetIdle);
+if (answerLine) answerLine.addEventListener("click", () => searchInput.focus());
+
 // On load, open a shared link (#user or #user/feed_id) if present;
 // otherwise start on the clean search screen.
 window.addEventListener("load", () => {
+  const raw = location.hash.replace(/^#/, "");
+  if (raw.startsWith("search/")) { searchClips(decodeURIComponent(raw.slice(7))); return; }
   const h = parseHash();
   if (h && h.username) selectUser(h.username, h.feedId);
-  else searchInput.focus();
+  else landingReset();
 });

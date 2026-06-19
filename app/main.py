@@ -39,6 +39,12 @@ async def api_search(q: str = Query(..., min_length=1)):
     return {"results": await service.search_users(q)}
 
 
+@app.get("/api/clips/search")
+async def api_clips_search(q: str = "", game: str | None = None, limit: int = 240):
+    """Search across every recovered clip (title / user / game). Local index only."""
+    return service.search_clips(q, game=game, limit=limit)
+
+
 @app.get("/api/user/{username}/header")
 async def api_user_header(username: str):
     """Lightweight profile header (avatar + name) for autocomplete enrichment."""
@@ -131,6 +137,26 @@ async def api_stream(feed_id: str, request: Request, dl: bool = False):
             await upstream.aclose()
 
     return StreamingResponse(body(), status_code=upstream.status_code, headers=headers)
+
+
+@app.get("/api/resolve/{feed_id}")
+async def api_resolve(feed_id: str):
+    """Resolve a clip's best archived source and report its tier — no video bytes.
+
+    The grid calls this lazily as cards scroll into view: a 'preview' tier
+    auto-loops muted on the card, 'full' opens in the player, 'none' stays a
+    thumbnail. The result is cached, so the subsequent /api/stream is instant.
+    """
+    if not re.fullmatch(r"[a-f0-9]+", feed_id):
+        raise HTTPException(400, "bad id")
+    url = await service.resolve_stream(feed_id)
+    st = service.cache.get_stream(feed_id)
+    quality = st["quality"] if st else None
+    if not url:
+        return {"feed_id": feed_id, "tier": "none"}
+    tier = "preview" if quality == service.PREVIEW_QUALITY else "full"
+    return {"feed_id": feed_id, "tier": tier, "quality": quality,
+            "stream": f"/api/stream/{feed_id}"}
 
 
 # --- video cache (site settings) ---------------------------------------------

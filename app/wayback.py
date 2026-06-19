@@ -109,21 +109,55 @@ async def _request(method: str, url: str, **kwargs) -> httpx.Response:
     raise last_exc
 
 
+class CdxUnavailable(Exception):
+    """The CDX API could not be queried (throttled / empty-200 / repeated 5xx).
+
+    Deliberately distinct from a query that *succeeded* and returned no rows.
+    Under load, web.archive.org's CDX often answers with an HTTP 200 and an
+    empty body instead of a 429 — which looks exactly like "no captures". If
+    callers can't tell those apart, the stream resolver caches a throttled probe
+    as a permanent "video not archived" miss, and a recoverable clip is lost.
+    """
+
+
 async def cdx(url_pattern: str, **params: Any) -> list[list[str]]:
     """Query the CDX API. Returns rows (first row is the header).
+
+    Returns ``[]`` only for a *definitive* empty result — the query ran and the
+    archive genuinely has no matching captures. Raises :class:`CdxUnavailable`
+    when the archive could not be queried (throttled, empty 200 body, or
+    repeated 5xx), so callers can avoid recording a false miss.
 
     Example: cdx("plays.tv/u/MLdini", fl="timestamp,original",
                  filter="statuscode:200", collapse="timestamp:8")
     """
     q = {"url": url_pattern, "output": "json"}
     q.update({k: v for k, v in params.items() if v is not None})
-    resp = await _request("GET", config.CDX_API, params=q)
-    if resp.status_code != 200 or not resp.text.strip():
-        return []
-    try:
-        return json.loads(resp.text)
-    except json.JSONDecodeError:
-        return []
+    last: Exception | None = None
+    for attempt in range(config.MAX_RETRIES + 1):
+        try:
+            resp = await _request("GET", config.CDX_API, params=q)
+        except httpx.HTTPError as exc:          # persistent 429/5xx after inner retries
+            last = exc
+        else:
+            if resp.status_code == 200:
+                text = resp.text.strip()
+                if text:
+                    try:
+                        return json.loads(text)
+                    except json.JSONDecodeError as exc:
+                        last = exc              # garbage/partial body -> treat as throttle
+                else:
+                    last = CdxUnavailable("empty 200 body (throttled)")
+            elif resp.status_code in (400, 403, 404):
+                return []                       # query ran, nothing matched -> definitive
+            else:
+                last = CdxUnavailable(f"cdx status {resp.status_code}")
+        if attempt < config.MAX_RETRIES:
+            await asyncio.sleep(
+                config.BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 0.4)
+            )
+    raise CdxUnavailable(f"cdx unavailable for {url_pattern!r}: {last}")
 
 
 async def fetch_raw(timestamp: str, original_url: str) -> str | None:
