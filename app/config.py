@@ -51,6 +51,10 @@ USER_AGENT = (
 
 # How long a cached user video-index stays fresh before we re-scrape (seconds).
 INDEX_TTL = 60 * 60 * 24 * 7   # 1 week
+# A scrape that recovered 0 clips is treated as provisional (the archive may have
+# been throttling): retry it after this much shorter window instead of caching an
+# empty result for a full week.
+EMPTY_INDEX_TTL = 60 * 60       # 1 hour
 
 # CORS: comma-separated allowed origins for when the frontend is hosted
 # separately (e.g. on Vercel). Defaults to "*" — the API serves only public,

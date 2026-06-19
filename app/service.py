@@ -13,11 +13,15 @@ from . import cache, config, parser, wayback
 from .parser import Profile, Video
 
 PROFILE_URL = "https://plays.tv/u/{user}"
+VIDEOS_URL = "https://plays.tv/u/{user}/videos"   # the dedicated videos tab
 CONN_URL = "https://plays.tv/u/{user}/{kind}"  # kind: followers | following
 # Cap how many snapshots we union per user (most-recent + spread of older ones).
 # Kept low so a lookup stays snappy; the early full snapshots already render ~60
 # videos each, so a handful recovers the vast majority.
 MAX_SNAPSHOTS = 6
+# Extra captures of the /videos tab (base + ?page=N) to union for older clips the
+# profile page no longer rendered. Capped so a lookup stays polite to the archive.
+MAX_VIDEO_PAGE_CAPS = 4
 
 # Tiny in-memory cache of autocomplete prefixes -> usernames (cleared on restart).
 _search_cache: dict[str, list[str]] = {}
@@ -91,7 +95,7 @@ async def enrich_user(username: str) -> dict:
     if cached and cached["avatar_url"]:
         return _user_dict(cached)
 
-    cap = await _latest_profile_snapshot(username)
+    cap = await _latest_ok_snapshot(PROFILE_URL.format(user=username))
     prof = Profile(username=username)
     if cap:
         html = await wayback.fetch_raw(cap, PROFILE_URL.format(user=username))
@@ -114,8 +118,14 @@ async def enrich_user(username: str) -> dict:
 async def get_user_videos(username: str, refresh: bool = False) -> dict:
     """Full recovered video list for a user (scrape-on-demand, then cached)."""
     cached_user = cache.get_user(username)
-    if not refresh and cached_user and cache.is_fresh(cached_user["last_indexed"]):
-        return _assemble(username, cached_user)
+    if not refresh and cached_user and cached_user["indexed_at"] is not None:
+        # Gate on indexed_at (a *completed* scrape), not last_indexed: a header-
+        # only autocomplete enrichment leaves indexed_at NULL and so never
+        # suppresses a real scrape. A 0-clip result is provisional (the archive
+        # may have been throttling), so it gets a much shorter retry window.
+        ttl = None if cached_user["recovered"] else config.EMPTY_INDEX_TTL
+        if cache.is_fresh(cached_user["indexed_at"], ttl):
+            return _assemble(username, cached_user)
 
     profile = await _scrape_user(username)
     if not profile.videos and not profile.display_name:
@@ -124,20 +134,23 @@ async def get_user_videos(username: str, refresh: bool = False) -> dict:
 
     # Flag deletions conservatively. A snapshot only renders the most-recent
     # ~60 videos, so "absent from the latest snapshot" alone over-counts (old
-    # videos simply scrolled off). We only call a clip *deleted* when it's from
-    # the same era as clips still on the profile at shutdown — i.e. newer than
-    # the oldest video still present — yet it's gone. Older gaps are "unknown".
+    # videos simply scrolled off). We only call a clip *deleted* when it falls
+    # within the live era — between the oldest and newest video still on the
+    # profile at shutdown — yet is gone. Clips outside that window (older gaps,
+    # or newer ones recovered from the /videos tab that postdate the live
+    # snapshot) are "unknown" and never flagged.
     live_ids = profile.live_feed_ids
     live_months = sorted(
         profile.videos[f].month for f in live_ids
         if profile.videos.get(f) and profile.videos[f].month
     )
     min_live_month = live_months[0] if live_months else None
+    max_live_month = live_months[-1] if live_months else None
 
     def is_deleted(v: Video) -> int:
         if v.feed_id in live_ids:
             return 0
-        if min_live_month and v.month and v.month >= min_live_month:
+        if min_live_month and v.month and min_live_month <= v.month <= max_live_month:
             return 1
         return 0
 
@@ -152,32 +165,45 @@ async def get_user_videos(username: str, refresh: bool = False) -> dict:
     recovered = len(video_dicts)
     cache.upsert_user(
         username, profile.display_name or username, profile.avatar_url,
-        profile.live_video_count, recovered,
+        profile.live_video_count, recovered, indexed=True,
     )
     cache.upsert_videos(username, video_dicts)
     return _assemble(username, cache.get_user(username))
 
 
 async def _scrape_user(username: str) -> Profile:
-    """Union all archived profile snapshots into one Profile."""
+    """Union archived profile + /videos-tab snapshots into one Profile.
+
+    The main profile page renders the most-recent clips; the dedicated /videos
+    tab (and its ?page=N captures) often preserves older ones the profile page
+    no longer showed, so we union both for the widest recovery.
+    """
     snaps = await _profile_snapshots(username)
+    caps = await _videos_page_captures(username)
     profile = Profile(username=username)
-    if not snaps:
+    if not snaps and not caps:
         return profile
 
-    # Snapshots are newest-first; the first one defines the "still live" set.
-    htmls = await asyncio.gather(
-        *[wayback.fetch_raw(ts, PROFILE_URL.format(user=username)) for ts in snaps]
-    )
-    profile.live_feed_ids = set()
-    for i, html in enumerate(htmls):
-        if not html:
-            continue
-        before = set(profile.videos)
-        parser.parse_profile_page(html, profile)
-        if i == 0:
-            # newest snapshot -> these are the videos still on the live profile
-            profile.live_feed_ids = set(profile.videos)
+    # Main profile snapshots, newest-first: the newest defines the set of clips
+    # still live on the profile at shutdown (drives the "deleted" flag).
+    if snaps:
+        htmls = await asyncio.gather(
+            *[wayback.fetch_raw(ts, PROFILE_URL.format(user=username)) for ts in snaps]
+        )
+        for i, html in enumerate(htmls):
+            if not html:
+                continue
+            parser.parse_profile_page(html, profile)
+            if i == 0:
+                # newest snapshot -> the videos still on the live profile
+                profile.live_feed_ids = set(profile.videos)
+
+    # Then union the /videos-tab captures — pure additive coverage.
+    if caps:
+        extra = await asyncio.gather(*[wayback.fetch_raw(ts, url) for ts, url in caps])
+        for html in extra:
+            if html:
+                parser.parse_profile_page(html, profile)
     return profile
 
 
@@ -203,12 +229,37 @@ async def _profile_snapshots(username: str) -> list[str]:
     return newest + rest[::step][: MAX_SNAPSHOTS - 3]
 
 
-async def _latest_profile_snapshot(username: str) -> str | None:
-    rows = await wayback.cdx(
-        PROFILE_URL.format(user=username),
-        fl="timestamp", limit="-1",   # no statuscode filter -> fast
-    )
-    return rows[1][0] if len(rows) > 1 else None
+async def _videos_page_captures(username: str) -> list[tuple[str, str]]:
+    """`(timestamp, url)` captures of the user's /videos tab, incl. ?page=N.
+
+    A CDX prefix query on `.../videos` surfaces the base tab and its paginated
+    captures in one call. We keep the newest 200/revisit capture per distinct
+    clean URL (dropping `?_t=` tracking dupes), order base-tab-then-pages and
+    cap it, so a lookup stays polite. Best-effort: a CDX hiccup here never breaks
+    a lookup whose profile snapshots already succeeded.
+    """
+    try:
+        rows = await wayback.cdx(
+            f"plays.tv/u/{username}/videos", matchType="prefix",
+            fl="timestamp,original,statuscode", limit="400",
+        )
+    except wayback.CdxUnavailable:
+        return []
+    newest: dict[str, str] = {}  # clean url -> newest timestamp
+    for r in rows[1:]:
+        if len(r) < 3 or r[2] not in ("200", "-"):
+            continue
+        ts, original = r[0], r[1]
+        if "/videos" not in original:
+            continue
+        tail = original.split("/videos", 1)[1]
+        if tail != "" and not tail.startswith("?page="):
+            continue  # skip ?_t= tracking dupes / deeper sub-paths
+        if original not in newest or ts > newest[original]:
+            newest[original] = ts
+    caps = [(ts, url) for url, ts in newest.items()]
+    caps.sort(key=lambda c: (len(c[1]), c[1]))  # base tab first, then ?page=1,2,…
+    return caps[:MAX_VIDEO_PAGE_CAPS]
 
 
 async def _latest_ok_snapshot(url: str) -> str | None:

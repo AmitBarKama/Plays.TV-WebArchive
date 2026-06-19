@@ -33,7 +33,8 @@ def _connect() -> sqlite3.Connection:
                 avatar_url    TEXT,
                 live_count    INTEGER,
                 recovered     INTEGER,
-                last_indexed  REAL
+                last_indexed  REAL,
+                indexed_at    REAL
             );
             CREATE INDEX IF NOT EXISTS idx_users_low ON users(username_low);
 
@@ -88,6 +89,14 @@ def _connect() -> sqlite3.Connection:
             CREATE INDEX IF NOT EXISTS idx_attempt_pattern ON attempt_log(url_pattern);
             """
         )
+        # Migration for DBs created before `indexed_at` existed. A header-only
+        # autocomplete enrichment must never look like a finished video index,
+        # so the scrape is gated on indexed_at; NULL on legacy rows means
+        # "re-scrape", which auto-heals profiles wrongly cached as "0 clips".
+        try:
+            _conn.execute("ALTER TABLE users ADD COLUMN indexed_at REAL")
+        except sqlite3.OperationalError:
+            pass  # column already present
         _conn.commit()
     return _conn
 
@@ -106,22 +115,34 @@ def upsert_user(
     avatar_url: str,
     live_count: int | None,
     recovered: int,
+    indexed: bool = False,
 ) -> None:
+    """Insert/update a user row.
+
+    ``indexed=True`` marks a *completed video index* (stamps ``indexed_at``).
+    The header-only enrichment path leaves ``indexed_at`` untouched so a hovered
+    autocomplete suggestion never looks like a finished scrape — ``get_user_videos``
+    gates the cache on ``indexed_at``, so an un-indexed row always re-scrapes.
+    """
+    indexed_at = time.time() if indexed else None
     with _lock:
         c = _connect()
         c.execute(
             """INSERT INTO users
                (username, username_low, display_name, avatar_url, live_count,
-                recovered, last_indexed)
-               VALUES (?,?,?,?,?,?,?)
+                recovered, last_indexed, indexed_at)
+               VALUES (?,?,?,?,?,?,?,?)
                ON CONFLICT(username) DO UPDATE SET
                  display_name=excluded.display_name,
                  avatar_url=excluded.avatar_url,
                  live_count=excluded.live_count,
                  recovered=excluded.recovered,
-                 last_indexed=excluded.last_indexed""",
+                 last_indexed=excluded.last_indexed,
+                 indexed_at=CASE WHEN excluded.indexed_at IS NOT NULL
+                                 THEN excluded.indexed_at
+                                 ELSE users.indexed_at END""",
             (username, username.lower(), display_name, avatar_url, live_count,
-             recovered, time.time()),
+             recovered, time.time(), indexed_at),
         )
         c.commit()
 
@@ -280,8 +301,9 @@ def put_connections(
         c.commit()
 
 
-def is_fresh(last_indexed: float | None) -> bool:
-    return last_indexed is not None and (time.time() - last_indexed) < config.INDEX_TTL
+def is_fresh(last_indexed: float | None, ttl: float | None = None) -> bool:
+    ttl = config.INDEX_TTL if ttl is None else ttl
+    return last_indexed is not None and (time.time() - last_indexed) < ttl
 
 
 # --- Phase 0: recovery instrumentation ---------------------------------------

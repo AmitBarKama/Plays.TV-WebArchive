@@ -147,17 +147,18 @@ document.addEventListener("click", (e) => {
 
 // ---------- load a user's videos ----------
 
-async function selectUser(username, feedId) {
+async function selectUser(username, feedId, opts = {}) {
   hideSuggestions();
   searchInput.value = username;
   hero.classList.add("compact");
   twStop(); resizeAnswer();
   resultsEl.hidden = false;
   resultsEl.scrollIntoView({ behavior: "smooth", block: "start" });
+  const verb = opts.refresh ? "Re-scanning" : "Searching";
   resultsEl.innerHTML = `
     <div class="state">
       <div class="spinner-lg"></div>
-      <h3>Searching the archive for “${escapeHtml(username)}”…</h3>
+      <h3>${verb} the archive for “${escapeHtml(username)}”…</h3>
       <p>Unioning every saved snapshot to recover deleted clips. This can take a few seconds.</p>
     </div>`;
   setHash(username);
@@ -167,9 +168,15 @@ async function selectUser(username, feedId) {
   const ctrl = new AbortController();
   const to = setTimeout(() => ctrl.abort(), 20000);
   try {
-    const r = await fetch(`/api/user/${encodeURIComponent(username)}/videos`, { signal: ctrl.signal });
+    // refresh=true bypasses the server cache and forces a fresh archive scrape.
+    const qs = opts.refresh ? "?refresh=true" : "";
+    const r = await fetch(`/api/user/${encodeURIComponent(username)}/videos${qs}`, { signal: ctrl.signal });
     clearTimeout(to);
     if (r.status === 404) { renderEmpty(username); return; }
+    if (r.status === 503) {
+      const d = await r.json().catch(() => ({}));
+      throw new Error(d.detail || "the Internet Archive is busy right now — try again in a moment");
+    }
     if (!r.ok) throw new Error(`the archive responded with ${r.status}`);
     const data = await r.json();
     if (!data.found) { renderEmpty(username); return; }
@@ -201,9 +208,10 @@ function renderState(html, btnLabel, onClick) {
 function renderEmpty(username) {
   renderState(
     `<h3>No archived clips found for “${escapeHtml(username)}”</h3>
-     <p>The handle may be spelled differently, or it was never captured by the archive.
-        Try the autocomplete suggestions for close matches.</p>`,
-    "Search again", () => selectUser(username));
+     <p>The handle may be spelled differently, it was never captured by the archive,
+        or the archive was briefly unavailable. Try a re-scan, or check the autocomplete
+        suggestions for close matches.</p>`,
+    "↻ Re-scan the archive", () => selectUser(username, null, { refresh: true }));
 }
 
 function renderError(username, e) {
@@ -241,11 +249,29 @@ function renderUser(data) {
   followingBtn.addEventListener("click", () => openConnections(data.username, "following"));
   conn.appendChild(followersBtn);
   conn.appendChild(followingBtn);
+  const rescanBtn = el("button", "conn-btn", "↻ Re-scan");
+  rescanBtn.title = "Re-fetch this profile from the archive (bypass the cache)";
+  rescanBtn.addEventListener("click", () => selectUser(data.username, null, { refresh: true }));
+  conn.appendChild(rescanBtn);
   info.appendChild(conn);
 
   head.appendChild(av);
   head.appendChild(info);
   resultsEl.appendChild(head);
+
+  if (!data.recovered) {
+    // Profile resolved but nothing came back — usually a transient archive
+    // hiccup, not a truly empty profile. Offer a one-click re-scan.
+    const empty = el("div", "state",
+      `<h3>No clips recovered yet</h3>
+       <p>We found this profile${data.live_count ? ` (it listed <b>${data.live_count}</b> clips at shutdown)` : ""},
+          but none came back this time — the Internet Archive may have been busy.</p>`);
+    const btn = el("button", "btn", "↻ Re-scan the archive");
+    btn.addEventListener("click", () => selectUser(data.username, null, { refresh: true }));
+    empty.appendChild(btn);
+    resultsEl.appendChild(empty);
+    return;
+  }
 
   resultsEl.appendChild(buildToolbar(data));
   const grid = el("div", "grid");
