@@ -1,0 +1,11 @@
+.venv/
+data/
+__pycache__/
+*.pyc
+.git/
+.DS_Store
+design-artifacts/
+_bmad-output/
+_bmad/
+*.md
+!README.md

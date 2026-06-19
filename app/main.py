@@ -7,14 +7,35 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import (FileResponse, JSONResponse, PlainTextResponse,
+                               StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 
-from . import service, videocache, wayback
+from . import config, service, videocache, wayback
 
 FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
 
 app = FastAPI(title="Plays.tv Recovery", version="1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(wayback.CdxUnavailable)
+async def _archive_unavailable(request: Request, exc: wayback.CdxUnavailable):
+    """The archive is throttling/unreachable — degrade gracefully, never a 500."""
+    return JSONResponse(
+        {"error": "archive_unavailable", "found": False,
+         "detail": "The Internet Archive is slow or unreachable right now. "
+                   "Try again in a moment."},
+        status_code=503,
+    )
 
 
 @app.on_event("shutdown")
@@ -23,9 +44,12 @@ async def _shutdown() -> None:
 
 
 @app.middleware("http")
-async def no_cache(request: Request, call_next):
-    """Never let the browser cache the frontend — always serve the latest code."""
+async def response_headers(request: Request, call_next):
+    """Keep the frontend uncached (always-latest code) and ask crawlers not to
+    index. memoryTV re-serves third-party clips, so it must never become the
+    named search index people get pointed at (consent guardrail)."""
     resp = await call_next(request)
+    resp.headers.setdefault("X-Robots-Tag", "noindex, nofollow")
     path = request.url.path
     if path == "/" or path.endswith((".js", ".css", ".html")):
         resp.headers["Cache-Control"] = "no-store, max-age=0, must-revalidate"
@@ -171,6 +195,19 @@ async def api_cache_stats():
 async def api_cache_clear():
     """Wipe the on-demand video cache ("delete folder")."""
     return videocache.clear()
+
+
+# --- ops + crawler policy ----------------------------------------------------
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    """Liveness probe for the host (Railway/Fly) and the recovery canary."""
+    return {"ok": True}
+
+
+@app.get("/robots.txt", include_in_schema=False)
+async def robots():
+    return PlainTextResponse("User-agent: *\nDisallow: /\n")
 
 
 # --- static frontend ---------------------------------------------------------

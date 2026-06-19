@@ -1,15 +1,19 @@
 """Central configuration for the Plays.tv recovery service."""
+import os
 from pathlib import Path
 
-# Where the SQLite cache lives.
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-DATA_DIR.mkdir(exist_ok=True)
+# Where persistent state lives. Override with MEMORYTV_DATA_DIR in production
+# (e.g. a mounted Railway/Fly volume at /data) so the SQLite cache + downloaded
+# clips survive restarts and redeploys.
+DATA_DIR = Path(os.environ.get("MEMORYTV_DATA_DIR")
+                or Path(__file__).resolve().parent.parent / "data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "cache.sqlite"
 
 # On-demand video cache: clips are downloaded here on first play, then served
 # locally (instant seeking + replay). Wiped manually from the site settings.
 VIDEO_CACHE_DIR = DATA_DIR / "video_cache"
-VIDEO_CACHE_DIR.mkdir(exist_ok=True)
+VIDEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Bulk CLI recovery scraper (app/scrape.py): where recovered .mp4s land, plus
 # its resumable checkpoint and log. All overridable via CLI flags.
@@ -47,6 +51,14 @@ USER_AGENT = (
 
 # How long a cached user video-index stays fresh before we re-scrape (seconds).
 INDEX_TTL = 60 * 60 * 24 * 7   # 1 week
+
+# CORS: comma-separated allowed origins for when the frontend is hosted
+# separately (e.g. on Vercel). Defaults to "*" — the API serves only public,
+# already-archived data and uses no cookies/credentials.
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get("MEMORYTV_ALLOWED_ORIGINS", "*").split(",")
+    if o.strip()
+] or ["*"]
 
 # Video qualities to try, best first.
 QUALITIES = ["1080", "720", "480", "360", "240"]

@@ -1,0 +1,33 @@
+# Fly.io deploy config (alternative to Railway). Edit `app` to your chosen name,
+# then: fly launch --no-deploy  (creates app+volume), fly deploy.
+app = "memorytv-recovery"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  MEMORYTV_DATA_DIR = "/data"
+
+# Persistent disk so the SQLite cache + downloaded clips survive restarts.
+[mounts]
+  source = "memorytv_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "suspend"   # sleep when idle (free-friendly); wakes on request
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.checks]
+    [http_service.checks.health]
+      method = "GET"
+      path = "/healthz"
+      interval = "30s"
+      timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
